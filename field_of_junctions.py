@@ -9,13 +9,41 @@ else:
     dev = torch.device('cpu')
 
 class FieldOfJunctions:
+    
+    """
+    Member Variables
+    ------
+    H, W, C            Dimensions of input image
+    H_patches          H', the number of rows of patches
+    W_patches          W', the number of cols of patches
+    num_iters          Total number of iterations (initialization + refinement)
+    img_patches        Tensor of shape [N, C, R, R, H' W'];  overlapping image patches
+    angles             Tensor of shape [1, 3, H', W'];       trainable set of 3 angles,   for each patch      
+    x0y0               Tensor of shape [1, 2, H', W'];       trainable vertex coordinate, for each patch
+    num_patches        Tensor of shape [H, W];               number of patches the pixel is in, for each pixel
+    x, y               Tensors of shape [1, R, R, 1, 1];     the local image grid, ranging from [-1, 1]
+    optimizers         = [angle optimizer, x0y0 optimizer];  uses lr_angles and lr_x0y0
+    angle_range        = [0, 2 * pi);                        nvals equally-spaced values to search over for angles
+    x0y0_range         = [-3, 3];                            nvals equally-spaced values to search over for x0y0
+    global_image       Current global image
+    global_boundaries  Current global boundary map
+    opts               Saved object from __init__()
+    """
+
+    """
+    Note:
+    The memory footprint is proportional to (R / s)^2 * H * W, where R is the patch size, s is the stride, and HxW is the image size.
+    In general, a stride of ~R/3 is usually sufficient, especially at relatively low noise levels.
+    The images in the project page were run using s > 1 and parallel_mode = False in order for them to fit in memory
+    """
+    
     def __init__(self, img, opts):
         """
         Inputs
         ------
         img    Input image: a numpy array of shape [H, W, C]
         opts   Object with the following attributes:
-               R                          Patch size
+               R                          Patch size; each patch can be thought of as an image with dimensions [R, R, 3]
                stride                     Stride for junctions (e.g. opts.stride == 1 is a dense field of junctions)
                eta                        Width parameter for Heaviside functions
                delta                      Width parameter for boundary maps
@@ -23,7 +51,7 @@ class FieldOfJunctions:
                lr_x0y0                    Vertex position learning rate
                lambda_boundary_final      Final value of spatial boundary consistency term
                lambda_color_final         Final value of spatial color consistency term
-               nvals                      Number of values to query in Algorithm 2 from the paper
+               nvals                      Number of values to query in Algorithm 2 from the paper (i.e. nvals angles, and nvals^2 positions)
                num_initialization_iters   Number of initialization iterations
                num_refinement_iters       Number of refinement iterations
                greedy_step_every_iters    Frequency of "greedy" iteration (applying Algorithm 2 with consistency)
@@ -100,6 +128,8 @@ class FieldOfJunctions:
         for iteration in range(self.num_iters):
             self.step(iteration)
 
+    # ================== The most important function! ==================
+
     def step(self, iteration):
         """
         Perform one step (either initialization's coordinate descent, or refinement gradient descent)
@@ -116,8 +146,10 @@ class FieldOfJunctions:
         lmbda_boundary = factor * self.opts.lambda_boundary_final
         lmbda_color    = factor * self.opts.lambda_color_final
 
-        if iteration < self.opts.num_initialization_iters or \
-               (iteration - self.opts.num_initialization_iters + 1) % self.opts.greedy_step_every_iters == 0:
+        is_initialization_phase    = iteration < self.opts.num_initialization_iters
+        should_do_greedy_init_step = (iteration - self.opts.num_initialization_iters + 1) % self.opts.greedy_step_every_iters == 0
+        
+        if is_initialization_phase or should_do_greedy_init_step:
             self.initialization_step(lmbda_boundary, lmbda_color)
         else:
             self.refinement_step(lmbda_boundary, lmbda_color)
@@ -140,6 +172,7 @@ class FieldOfJunctions:
         for i in range(5):
             # Repeat the set of parameters `nvals` times along 0th dimension
             params_query = params.repeat(self.opts.nvals, 1, 1, 1)
+
             param_range = self.angle_range if i < 3 else self.x0y0_range
             params_query[:, i, :, :] = params_query[:, i, :, :] + param_range.view(-1, 1, 1)
             best_ind = self.get_best_inds(params_query, lmbda_boundary, lmbda_color)
@@ -174,7 +207,6 @@ class FieldOfJunctions:
         self.global_image      = self.local2global(patches)
         self.global_boundaries = self.local2global(self.dists2boundaries(dists))
 
-
     def refinement_step(self, lmbda_boundary, lmbda_color):
         """
         Perform a single refinement step
@@ -203,7 +235,6 @@ class FieldOfJunctions:
         dists, colors, patches = self.get_dists_and_patches(params, lmbda_color)
         self.global_image      = self.local2global(patches)
         self.global_boundaries = self.local2global(self.dists2boundaries(dists))
-            
             
     def get_loss(self, dists, colors, patches, lmbda_boundary, lmbda_color):
         """
@@ -281,8 +312,6 @@ class FieldOfJunctions:
 
         return consistency
 
-    
-    
     def get_dists_and_patches(self, params, lmbda_color=0.0):
         """
         Compute distance functions and piecewise-constant patches given junction parameters.
