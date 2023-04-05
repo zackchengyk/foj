@@ -471,20 +471,22 @@ class FieldOfJunctions:
         def g(dtheta):
             # Map from [0, 2pi] to [-1, 1]
             return (dtheta / np.pi - 1.0) ** 35
+        
+        def d_l(phi_l):
+            return -(self.x - x0) * torch.sin(phi_l) + (self.y - y0) * torch.cos(phi_l)
 
         # Compute the two distance functions
         sgn42 = torch.where(torch.remainder(angle2 - angle4, 2 * np.pi) < np.pi,
                             torch.ones_like(angle2), -torch.ones_like(angle2))
         tau42 = g(torch.remainder(angle2 - angle4, 2*np.pi)) * tau
-
-        dist42 = sgn42 * torch.min( sgn42 * (-torch.sin(angle4) * (self.x - x0) + torch.cos(angle4) * (self.y - y0)),
-                                   -sgn42 * (-torch.sin(angle2) * (self.x - x0) + torch.cos(angle2) * (self.y - y0))) + tau42
+        dist42 = sgn42 * torch.min( sgn42 * d_l(angle4),
+                                   -sgn42 * d_l(angle2)) + tau42
 
         sgn13 = torch.where(torch.remainder(angle3 - angle1, 2 * np.pi) < np.pi,
                             torch.ones_like(angle3), -torch.ones_like(angle3))
         tau13 = g(torch.remainder(angle3 - angle1, 2*np.pi)) * tau
-        dist13 = sgn13 * torch.min( sgn13 * (-torch.sin(angle1) * (self.x - x0) + torch.cos(angle1) * (self.y - y0)),
-                                   -sgn13 * (-torch.sin(angle3) * (self.x - x0) + torch.cos(angle3) * (self.y - y0))) + tau13
+        dist13 = sgn13 * torch.min( sgn13 * d_l(angle1),
+                                   -sgn13 * d_l(angle3)) + tau13
 
         return torch.stack([dist13, dist42], dim=1)
 
