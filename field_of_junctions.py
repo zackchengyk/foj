@@ -78,12 +78,16 @@ class FieldOfJunctions:
                                                                              self.H_patches, self.W_patches)
 
         # Create pytorch variables for angles and vertex position for each patch
-        self.angles = torch.zeros(1, 3, self.H_patches, self.W_patches, dtype=torch.float32, device=dev)
-        self.x0y0   = torch.zeros(1, 2, self.H_patches, self.W_patches, dtype=torch.float32, device=dev)
+        self.azis = torch.zeros(1, 1, self.H_patches, self.W_patches, dtype=torch.float32, device=dev)
+        self.eles = torch.zeros(1, 1, self.H_patches, self.W_patches, dtype=torch.float32, device=dev)
+        self.x1y1 = torch.zeros(1, 2, self.H_patches, self.W_patches, dtype=torch.float32, device=dev)
+        self.x2y2 = torch.zeros(1, 2, self.H_patches, self.W_patches, dtype=torch.float32, device=dev)
 
         # Compute gradients for angles and vertex positions
-        self.angles.requires_grad = True
-        self.x0y0.requires_grad   = True
+        self.azis.requires_grad = True
+        self.eles.requires_grad = True
+        self.x1y1.requires_grad = True
+        self.x2y2.requires_grad = True
 
         # Compute number of patches containing each pixel: has shape [H, W]
         self.num_patches = torch.nn.Fold(output_size=[self.H, self.W],
@@ -104,15 +108,16 @@ class FieldOfJunctions:
         adam_eps   = 1e-08
 
         # Create optimizers for angles and vertices
-        optimizer_angles = optim.Adam([self.angles],
-                                       opts.lr_angles, [adam_beta1, adam_beta2], eps=adam_eps)
-        optimizer_x0y0   = optim.Adam([self.x0y0],
-                                       opts.lr_x0y0,   [adam_beta1, adam_beta2], eps=adam_eps)
-        self.optimizers = [optimizer_angles, optimizer_x0y0]
+        optimizer_azis = optim.Adam([self.azis], opts.lr_angles, [adam_beta1, adam_beta2], eps=adam_eps)
+        optimizer_eles = optim.Adam([self.eles], opts.lr_angles, [adam_beta1, adam_beta2], eps=adam_eps)
+        optimizer_x1y1 = optim.Adam([self.x1y1], opts.lr_x0y0,   [adam_beta1, adam_beta2], eps=adam_eps)
+        optimizer_x2y2 = optim.Adam([self.x2y2], opts.lr_x0y0,   [adam_beta1, adam_beta2], eps=adam_eps)
+        self.optimizers = [optimizer_azis, optimizer_eles, optimizer_x1y1, optimizer_x2y2]
 
         # Values to search over in Algorithm 2: [0, 2pi) for angles, [-3, 3] for vertex position.
-        self.angle_range = torch.linspace(0.0, 2*np.pi, opts.nvals+1, device=dev)[:opts.nvals]
-        self.x0y0_range  = torch.linspace(-3.0, 3.0, opts.nvals, device=dev)
+        self.azi_range = torch.linspace(0.00, 2.0 * np.pi, opts.nvals+1, device=dev)[:opts.nvals]
+        self.ele_range = torch.linspace(0.01, 0.5 * np.pi, opts.nvals+1, device=dev)[:opts.nvals]
+        self.xy_range  = torch.linspace(-3.0, 3.0, opts.nvals, device=dev)
 
         # Save current global image and boundary map (initially None)
         self.global_image      = None
@@ -166,15 +171,22 @@ class FieldOfJunctions:
         lmbda_boundary    Spatial consistency boundary loss weight
         lmbda_color       Spatial consistency color loss weight
         """
-        params = torch.cat([self.angles, self.x0y0], dim=1).detach()
+        params = torch.cat([self.azis, self.eles, self.x1y1, self.x2y2], dim=1).detach()
+
+        params[0, 0, :, :] = np.pi/2 - 0.1 # this one is slightly incorrect
 
         # Run one step of Algorithm 2, sequentially improving each coordinate
-        for i in range(5):
+        for i in range(6):
             # Repeat the set of parameters `nvals` times along 0th dimension
             params_query = params.repeat(self.opts.nvals, 1, 1, 1)
 
-            param_range = self.angle_range if i < 3 else self.x0y0_range
-            params_query[:, i, :, :] = params_query[:, i, :, :] + param_range.view(-1, 1, 1)
+            param_range = self.xy_range
+            if   i == 0:
+                param_range = self.azi_range
+            elif i == 1:
+                param_range = self.ele_range
+
+            params_query[:, i, :, :] = param_range.view(-1, 1, 1)
             best_ind = self.get_best_inds(params_query, lmbda_boundary, lmbda_color)
 
             # Update parameters
@@ -182,25 +194,14 @@ class FieldOfJunctions:
                                               i,
                                               torch.arange(self.H_patches).view(1, -1, 1),
                                               torch.arange(self.W_patches).view(1, 1, -1)]
-
-        # Heuristic for accelerating convergence (not necessary but sometimes helps):
-        # Update x0 and y0 along the three optimal angles (search over a line passing through current x0, y0)
-        for i in range(3):
-            params_query = params.repeat(self.opts.nvals, 1, 1, 1)
-            params_query[:, 3, :, :] = params[:, 3, :, :] + torch.cos(params[:, i, :, :]) * self.x0y0_range.view(-1, 1, 1)
-            params_query[:, 4, :, :] = params[:, 4, :, :] + torch.sin(params[:, i, :, :]) * self.x0y0_range.view(-1, 1, 1)
-            best_ind = self.get_best_inds(params_query, lmbda_boundary, lmbda_color)
-
-            # Update vertex positions of parameters
-            for j in range(3, 5):
-                params[:, j, :, :] = params_query[best_ind.view(1, self.H_patches, self.W_patches),
-                                                  j,
-                                                  torch.arange(self.H_patches).view(1, -1, 1),
-                                                  torch.arange(self.W_patches).view(1, 1, -1)]
+            
+            params[0, 0, :, :] = np.pi/2 - 0.1 # this one is slightly incorrect
 
         # Update angles and vertex position using the best values found
-        self.angles.data = params[:, :3, :, :].data
-        self.x0y0.data   = params[:, 3:, :, :].data
+        self.azis.data = params[:, 0:1, :, :].data
+        self.eles.data = params[:, 1:2, :, :].data
+        self.x1y1.data = params[:, 2:4, :, :].data
+        self.x2y2.data = params[:, 4:6, :, :].data
         
         # Update global boundaries and image
         dists, colors, patches = self.get_dists_and_patches(params, lmbda_color)
@@ -216,7 +217,7 @@ class FieldOfJunctions:
         lmbda_boundary    Spatial consistency boundary loss weight
         lmbda_color       Spatial consistency color loss weight
         """
-        params = torch.cat([self.angles, self.x0y0], dim=1)
+        params = torch.cat([self.azis, self.eles, self.x1y1, self.x2y2], dim=1)
 
         # Compute distance functions, colors, and junction patches
         dists, colors, patches = self.get_dists_and_patches(params, lmbda_color)
@@ -366,12 +367,15 @@ class FieldOfJunctions:
         -------
                  Tensor of shape [N, 1, R, R, H', W'] with values of boundary map for every patch
         """
-        # Find places where either distance transform is small, except where d1 > 0 and d2 < 0
-        d1 = dists[:, 0:1, :, :, :, :]
-        d2 = dists[:, 1:2, :, :, :, :]
-        minabsdist = torch.where(d1 < 0.0, -d1, torch.where(d2 < 0.0, torch.min(d1, -d2), torch.min(d1, d2)))
 
-        return 1.0 / (1.0 + (minabsdist / self.opts.delta) ** 2)
+        # Find places where either distance transform is small, except where distA > 0
+        distA = dists[:, 0:1, :, :, :, :]
+        distB = dists[:, 1:2, :, :, :, :]
+        min_abs_dist = torch.where(distA > 0.0,
+                                   distA,
+                                   torch.min(torch.abs(distA), torch.abs(distB)))
+        
+        return 1.0 / (1.0 + (min_abs_dist / self.opts.delta) ** 2)
 
     def local2global(self, patches):
         """
@@ -403,8 +407,8 @@ class FieldOfJunctions:
 
         Inputs
         ------
-        params            Tensor of shape [N, 5, H', W'] holding N field of junctions parameters. Each
-                          5-vector has format (angle1, angle2, angle3, x0, y0).
+        params            Tensor of shape [N, 6, H', W'] holding N field of junctions parameters. Each
+                          6-vector has format (azi, ele, x_1, y_1, x_2, y_2).
         lmbda_boundary    Spatial consistency boundary loss weight
         lmbda_color       Spatial consistency color loss weight
 
@@ -417,6 +421,7 @@ class FieldOfJunctions:
             dists, colors, smooth_patches = self.get_dists_and_patches(params, lmbda_color)
             loss_per_patch = self.get_loss(dists, colors, smooth_patches, lmbda_boundary, lmbda_color)
             best_ind = loss_per_patch.argmin(dim=0)
+            # Todo: investigate if this is working as expected!
 
         else:
             # First initialize tensors
@@ -441,54 +446,52 @@ class FieldOfJunctions:
 
         Inputs
         ------
-        params   Tensor of shape [N, 5, H', W'] holding N field of junctions parameters. Each
-                 5-vector has format (angle1, angle2, angle3, x0, y0).
+        params   Tensor of shape [N, 6, H', W'] holding N field of junctions parameters. Each
+                 6-vector has format (azi, ele, x_1, y_1, x_2, y_2).
         tau      Constant used for lifting the level set function to be either entirely positive
                  or entirely negative when an angle approaches 0 or 2pi.
-
 
         Outputs
         -------
                  Tensor of shape [N, 2, R, R, H', W'] with samples of the two distance functions for every patch
         """
-        x0     = params[:, 3, :, :].unsqueeze(1).unsqueeze(1)   # shape [N, 1, 1, H', W']
-        y0     = params[:, 4, :, :].unsqueeze(1).unsqueeze(1)   # shape [N, 1, 1, H', W']
 
-        # Sort so angle1 <= angle2 <= angle3 (mod 2pi)
-        angles = torch.remainder(params[:, :3, :, :], 2 * np.pi)
-        angles = torch.sort(angles, dim=1)[0]
+        azi = params[:, 0, :, :].unsqueeze(1).unsqueeze(1)   # shape [N, 1, 1, H', W']
+        ele = params[:, 1, :, :].unsqueeze(1).unsqueeze(1)   # shape [N, 1, 1, H', W']
+        x_1 = params[:, 2, :, :].unsqueeze(1).unsqueeze(1)   # shape [N, 1, 1, H', W']
+        y_1 = params[:, 3, :, :].unsqueeze(1).unsqueeze(1)   # shape [N, 1, 1, H', W']
+        x_2 = params[:, 4, :, :].unsqueeze(1).unsqueeze(1)   # shape [N, 1, 1, H', W']
+        y_2 = params[:, 5, :, :].unsqueeze(1).unsqueeze(1)   # shape [N, 1, 1, H', W']
 
-        angle1 = angles[:, 0, :, :].unsqueeze(1).unsqueeze(1)   # shape [N, 1, 1, H', W']
-        angle2 = angles[:, 1, :, :].unsqueeze(1).unsqueeze(1)   # shape [N, 1, 1, H', W']
-        angle3 = angles[:, 2, :, :].unsqueeze(1).unsqueeze(1)   # shape [N, 1, 1, H', W']
+        # Decide to switch
+        def flip_180(angle):
+            return torch.remainder(angle - np.pi, 2 * np.pi)
+        angle_1 = self.get_angle(x_1, y_1, azi, ele)
+        angle_2 = self.get_angle(x_2, y_2, azi, ele)
+        temp_1  = torch.min(angle_1, flip_180(angle_1))
+        temp_2  = torch.min(angle_2, flip_180(angle_2))
+        condition = temp_2 < temp_1
 
-        # Define another angle halfway between angle3 and angle1, clockwise from angle3
-        # This isn't critical but it seems a bit more stable for computing gradients
-        angle4 = 0.5 * (angle1 + angle3) + \
-                     torch.where(torch.remainder(0.5 * (angle1 - angle3), 2 * np.pi) >= np.pi,
-                                 torch.ones_like(angle1) * np.pi, torch.zeros_like(angle1))
+        # Execute switch
+        angle_a = torch.where(condition, angle_1, angle_2)
+        angle_b = torch.where(condition, angle_2, angle_1)
+        x_a     = torch.where(condition, x_1, x_2)
+        y_a     = torch.where(condition, y_1, y_2)
+        x_b     = torch.where(condition, x_2, x_1)
+        y_b     = torch.where(condition, y_2, y_1)
 
-        def g(dtheta):
-            # Map from [0, 2pi] to [-1, 1]
-            return (dtheta / np.pi - 1.0) ** 35
+        # Get SDFs
+        def d(x_on_line, y_on_line, angle, x_in_negative, y_in_negative):
+            tester = -(x_in_negative - x_on_line) * torch.sin(angle) + (y_in_negative - y_on_line) * torch.cos(angle)
+            sign = torch.where(tester > 0,
+                               -torch.ones_like(angle),
+                               +torch.ones_like(angle))
+            return sign * ( -(self.x - x_on_line) * torch.sin(angle) + (self.y - y_on_line) * torch.cos(angle) )
         
-        def d_l(phi_l):
-            return -(self.x - x0) * torch.sin(phi_l) + (self.y - y0) * torch.cos(phi_l)
+        distA = d(x_a, y_a, angle_a, x_b, y_b)
+        distB = d(x_b, y_b, angle_b, x_a, y_a)
 
-        # Compute the two distance functions
-        sgn42 = torch.where(torch.remainder(angle2 - angle4, 2 * np.pi) < np.pi,
-                            torch.ones_like(angle2), -torch.ones_like(angle2))
-        tau42 = g(torch.remainder(angle2 - angle4, 2*np.pi)) * tau
-        dist42 = sgn42 * torch.min( sgn42 * d_l(angle4),
-                                   -sgn42 * d_l(angle2)) + tau42
-
-        sgn13 = torch.where(torch.remainder(angle3 - angle1, 2 * np.pi) < np.pi,
-                            torch.ones_like(angle3), -torch.ones_like(angle3))
-        tau13 = g(torch.remainder(angle3 - angle1, 2*np.pi)) * tau
-        dist13 = sgn13 * torch.min( sgn13 * d_l(angle1),
-                                   -sgn13 * d_l(angle3)) + tau13
-
-        return torch.stack([dist13, dist42], dim=1)
+        return torch.stack([distA, distB], dim=1)
 
     def dists2indicators(self, dists):
         """
@@ -502,10 +505,32 @@ class FieldOfJunctions:
         -------
                 Tensor of shape [N, 3, R, R, H', W'] with samples of the three indicator functions for every patch
         """
-        # Apply smooth Heaviside function to distance functions
-        hdists = 0.5 * (1.0 + (2.0 / np.pi) * torch.atan(dists / self.opts.eta))
 
-        # Convert Heaviside functions into wedge indicator functions
-        return torch.stack([1.0 - hdists[:, 0, :, :, :, :],
-                                  hdists[:, 0, :, :, :, :] * (1.0 - hdists[:, 1, :, :, :, :]),
-                                  hdists[:, 0, :, :, :, :] *        hdists[:, 1, :, :, :, :]], dim=1)
+        # Convert line SDFs into wedge SDFs
+        pre_h = torch.stack([           dists[:, 0, :, :, :, :],
+                             torch.min(-dists[:, 0, :, :, :, :], -dists[:, 1, :, :, :, :]),
+                             torch.min(-dists[:, 0, :, :, :, :], +dists[:, 1, :, :, :, :])], dim=1)
+
+        # Apply smooth Heaviside function to SDFs
+        indicators = 0.5 * (1.0 + (2.0 / np.pi) * torch.atan(pre_h / self.opts.eta))
+
+        return indicators
+    
+    def get_angle(self, x_p, y_p, azi, ele):
+        
+        def sph2cart(azimuth, elevation, radius):
+            x = radius * torch.cos(elevation) * torch.cos(azimuth)
+            y = radius * torch.cos(elevation) * torch.sin(azimuth)
+            z = radius * torch.sin(elevation)
+            return x, y, z
+
+        x_c, y_c, z_c = sph2cart(azi, ele, 1)
+
+        # Fixme: handle z_c == 0
+        x_c /= z_c
+        y_c /= z_c
+
+        x_d = x_p - x_c
+        y_d = y_p - y_c
+
+        return torch.remainder(torch.atan2(y_d, x_d), 2 * np.pi)
